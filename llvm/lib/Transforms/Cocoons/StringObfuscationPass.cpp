@@ -83,12 +83,18 @@ PreservedAnalyses StringObfuscationPass::run(Module &M, ModuleAnalysisManager &A
 
     // 2. 加密每个字符串，为每个字符串创建独立的解密函数
     std::vector<EncryptedStringInfo> Entries;
+    std::random_device RD;
+    std::mt19937 Gen(RD());
+    std::uniform_int_distribution<int> DummyCount(1, 3);
+
     for (GlobalVariable *GV : Targets) {
         auto Info = encryptRealData(M, GV);
         if (Info.has_value()) {
             EncryptedStringInfo Entry = Info.value();
             Entry.DecryptFunc = createDecryptFunctionForString(M, Entry);
             Entries.push_back(Entry);
+            // 插入 1-3 个 dummy 函数混淆布局
+            createDummyFunctions(M, DummyCount(Gen));
         }
     }
 
@@ -288,16 +294,12 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
     Type *Int8Ty = Type::getInt8Ty(Ctx);
     Type *Int32Ty = Type::getInt32Ty(Ctx);
 
-    // 生成随机函数名和 section
+    // 生成随机函数名
     std::random_device RD;
     std::mt19937 Gen(RD());
     std::uniform_int_distribution<uint32_t> Dist(0, 0xFFFFFFFF);
     uint32_t Hash = Dist(Gen);
     std::string FuncName = "__ccs_" + std::to_string(Hash);
-
-    // 随机选择 section 分散函数布局（Mach-O 格式：segment,section）
-    std::uniform_int_distribution<int> SectionDist(0, 7);
-    std::string SectionName = "__TEXT,__ccs" + std::to_string(SectionDist(Gen));
 
     Function *DecryptFunc = nullptr;
 
@@ -305,7 +307,6 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
         // Mode A: key/op 数组解密
         FunctionType *FTy = FunctionType::get(VoidTy, {}, false);
         DecryptFunc = Function::Create(FTy, GlobalValue::InternalLinkage, FuncName, &M);
-        DecryptFunc->setSection(SectionName);
 
         BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", DecryptFunc);
         BasicBlock *DoDecBB = BasicBlock::Create(Ctx, "do_decrypt", DecryptFunc);
@@ -373,7 +374,6 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
         // Mode B: seed + PRNG 解密
         FunctionType *FTy = FunctionType::get(VoidTy, {}, false);
         DecryptFunc = Function::Create(FTy, GlobalValue::InternalLinkage, FuncName, &M);
-        DecryptFunc->setSection(SectionName);
 
         BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", DecryptFunc);
         BasicBlock *DoDecBB = BasicBlock::Create(Ctx, "do_decrypt", DecryptFunc);
@@ -452,6 +452,37 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
     }
 
     return DecryptFunc;
+}
+
+// ============================================================
+// createDummyFunctions() — 创建 dummy 函数混淆布局
+// ============================================================
+void StringObfuscationPass::createDummyFunctions(Module &M, int count) {
+    LLVMContext &Ctx = M.getContext();
+    Type *Int32Ty = Type::getInt32Ty(Ctx);
+
+    std::random_device RD;
+    std::mt19937 Gen(RD());
+    std::uniform_int_distribution<uint32_t> Dist(0, 0xFFFFFFFF);
+
+    SmallVector<GlobalValue *, 8> UsedFuncs;
+    for (int i = 0; i < count; ++i) {
+        std::string Name = "__dummy_" + std::to_string(Dist(Gen));
+        FunctionType *FTy = FunctionType::get(Int32Ty, {Int32Ty, Int32Ty}, false);
+        Function *F = Function::Create(FTy, GlobalValue::InternalLinkage, Name, &M);
+
+        BasicBlock *BB = BasicBlock::Create(Ctx, "entry", F);
+        IRBuilder<> B(BB);
+        Value *A = F->getArg(0);
+        Value *B_val = F->getArg(1);
+        Value *Res = B.CreateAdd(B.CreateMul(A, B_val), B.CreateXor(A, B_val));
+        B.CreateRet(Res);
+
+        UsedFuncs.push_back(F);
+    }
+
+    if (!UsedFuncs.empty())
+        appendToUsed(M, UsedFuncs);
 }
 
 // ============================================================

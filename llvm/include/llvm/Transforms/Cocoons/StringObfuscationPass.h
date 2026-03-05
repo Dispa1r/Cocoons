@@ -43,6 +43,9 @@ private:
     /// 为单个字符串创建独立的解密函数（随机函数名）
     Function* createDecryptFunctionForString(Module &M, const EncryptedStringInfo &Info);
 
+    /// 创建 dummy 函数用于混淆解密函数布局
+    void createDummyFunctions(Module &M, int count);
+
     /// 在每个字符串使用点前插入解密调用
     void instrumentUseSites(Module &M,
                             const std::vector<EncryptedStringInfo> &Entries);
