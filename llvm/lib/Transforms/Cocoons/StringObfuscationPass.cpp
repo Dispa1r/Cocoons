@@ -288,12 +288,16 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
     Type *Int8Ty = Type::getInt8Ty(Ctx);
     Type *Int32Ty = Type::getInt32Ty(Ctx);
 
-    // 生成随机函数名
+    // 生成随机函数名和 section
     std::random_device RD;
     std::mt19937 Gen(RD());
     std::uniform_int_distribution<uint32_t> Dist(0, 0xFFFFFFFF);
     uint32_t Hash = Dist(Gen);
     std::string FuncName = "__ccs_" + std::to_string(Hash);
+
+    // 随机选择 section 分散函数布局（Mach-O 格式：segment,section）
+    std::uniform_int_distribution<int> SectionDist(0, 7);
+    std::string SectionName = "__TEXT,__ccs" + std::to_string(SectionDist(Gen));
 
     Function *DecryptFunc = nullptr;
 
@@ -301,6 +305,7 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
         // Mode A: key/op 数组解密
         FunctionType *FTy = FunctionType::get(VoidTy, {}, false);
         DecryptFunc = Function::Create(FTy, GlobalValue::InternalLinkage, FuncName, &M);
+        DecryptFunc->setSection(SectionName);
 
         BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", DecryptFunc);
         BasicBlock *DoDecBB = BasicBlock::Create(Ctx, "do_decrypt", DecryptFunc);
@@ -368,6 +373,7 @@ Function* StringObfuscationPass::createDecryptFunctionForString(
         // Mode B: seed + PRNG 解密
         FunctionType *FTy = FunctionType::get(VoidTy, {}, false);
         DecryptFunc = Function::Create(FTy, GlobalValue::InternalLinkage, FuncName, &M);
+        DecryptFunc->setSection(SectionName);
 
         BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", DecryptFunc);
         BasicBlock *DoDecBB = BasicBlock::Create(Ctx, "do_decrypt", DecryptFunc);
