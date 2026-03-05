@@ -4,30 +4,12 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <cstdint>
+#include <optional>
 #include <vector>
 
 using namespace llvm;
 
 namespace cocoons {
-
-// class StringObfuscationPass : public PassInfoMixin<StringObfuscationPass> {
-// public:
-//     PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
-
-//     static bool isEnabled();
-
-// private:
-//     struct ObfuscateEntry {
-//         GlobalVariable *GV;
-//         uint8_t Key;
-//     };
-
-// private:
-//     void processVariable(GlobalVariable *GV, std::vector<ObfuscateEntry> &ObfList, Module &M);
-//     Function* createDecodeHelper(Module &M);
-//     void createMainDecryptFunc(Module &M, std::vector<ObfuscateEntry> &ObfList);
-//     void encryptRealData(GlobalVariable *TargetGV, std::vector<ObfuscateEntry> &ObfList, Module &M);
-// };
 
 class StringObfuscationPass : public PassInfoMixin<StringObfuscationPass> {
 public:
@@ -36,36 +18,37 @@ public:
     static bool isEnabled();
 
 private:
-    /**
-     * @brief 处理全局变量，识别可混淆的字符串
-     * @param GV 当前全局变量
-     * @param Targets 存储所有可混淆字符串的全局变量列表
-     * @param M 当前 Module
-     */
-    void processVariable(GlobalVariable *GV, std::vector<GlobalVariable *> &Targets, Module &M);
-    
-    /** 
-     * @brief 加密字符串
-     */
-    bool encryptRealData(Module &M, GlobalVariable *TargetGV, uint8_t Key);
-    /**
-     * @brief 生成混淆元数据并写入指定 Section
-     * @param M 当前 Module
-     * @param EncryptedGV 已加密的全局字符串变量
-     * @param Len 字符串长度
-     * @param Key 混淆所使用的 XOR Key
-     */
-    void emitMetadata(Module &M, GlobalVariable *EncryptedGV, uint32_t Len, uint8_t Key);
+    /// 加密字符串的信息记录
+    struct EncryptedStringInfo {
+        GlobalVariable *GV;       // 加密后的字符串全局变量
+        uint32_t Len;             // 字符串长度（含 \0）
+        GlobalVariable *GuardGV;  // 每字符串的 guard 变量（i8, init 0）
+        Function *DecryptFunc;    // 每字符串独立的解密函数
+        bool UsePRNG;             // true = Mode B (seed+PRNG), false = Mode A (key/op arrays)
+        // Mode A fields
+        GlobalVariable *KeyArrayGV = nullptr;  // [N x i8] per-byte key 数组
+        GlobalVariable *OpArrayGV  = nullptr;  // [N x i8] per-byte op 数组
+        // Mode B fields
+        uint32_t Seed = 0;        // PRNG seed
+    };
 
-    /**
-     * @brief 将元数据变量标记为已使用，防止被链接器优化剔除
-     */
-    void markUsed(Module &M, GlobalVariable *GV);
+    /// 递归解析全局变量，定位底层 i8 字节数组
+    void processVariable(GlobalVariable *GV,
+                         std::vector<GlobalVariable *> &Targets, Module &M);
 
-    /**
-     *
-     */
-    void injectDecrypter(Module &M);
+    /// 加密字符串数据，创建 guard 变量，返回加密信息
+    std::optional<EncryptedStringInfo> encryptRealData(Module &M,
+                                                       GlobalVariable *TargetGV);
+
+    /// 为单个字符串创建独立的解密函数（随机函数名）
+    Function* createDecryptFunctionForString(Module &M, const EncryptedStringInfo &Info);
+
+    /// 在每个字符串使用点前插入解密调用
+    void instrumentUseSites(Module &M,
+                            const std::vector<EncryptedStringInfo> &Entries);
+
+    /// xorshift32 PRNG（编译时用，和运行时 IR 生成的逻辑一致）
+    static uint32_t xorshift32(uint32_t &state);
 };
 
 } // namespace cocoons

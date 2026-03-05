@@ -7,6 +7,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include <cstdlib>
 #include <vector>
 
 namespace cocoons {
@@ -45,7 +46,11 @@ PreservedAnalyses SubstitutionPass::run(Function &F, FunctionAnalysisManager &AM
 }
 
 bool SubstitutionPass::isEnabled() {
-    return EnableSub;
+    if (EnableSub)
+        return true;
+    if (const char *Env = std::getenv("COCOONS_ENABLE_SUB"))
+        return std::string(Env) == "1";
+    return false;
 }
 
 void SubstitutionPass::substitute(BinaryOperator *Bo) {

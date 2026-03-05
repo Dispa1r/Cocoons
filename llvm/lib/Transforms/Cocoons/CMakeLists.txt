@@ -1,19 +1,19 @@
-# 定义一个 LLVM 组件库
-add_llvm_component_library(LLVMCocoons
+# Cocoons Pass Plugin（动态库）
+# 不显式链接 LLVMCore/LLVMSupport 等静态库，
+# 运行时从宿主进程（clang）解析符号，避免 cl::opt 重复注册。
+add_llvm_pass_plugin(CocoonsPasses
+  CocoonsPasses.cpp
   StringObfuscationPass.cpp
   SubstitutionPass.cpp
 
-  # 声明对应的头文件目录
   ADDITIONAL_HEADER_DIRS
-  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Obfuscation
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Cocoons
 
-  # 依赖项：生成 TableGen 定义的头文件
   DEPENDS
   intrinsics_gen
-
-  # 链接组件
-  LINK_COMPONENTS
-  Core            # 提供 BasicBlock, Function, Module 等基础 IR 对象
-  Support         # 提供 cl::opt 命令行解析和 errs() 打印
-  TransformUtils  # 提供 appendToGlobalCtors 等工具函数
 )
+
+# macOS 上用 -undefined dynamic_lookup 让 dylib 在加载时从宿主进程解析 LLVM 符号
+if(APPLE)
+  target_link_options(CocoonsPasses PRIVATE -undefined dynamic_lookup)
+endif()
