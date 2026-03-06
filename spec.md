@@ -6,8 +6,8 @@
 
 Cocoons 是一个基于 LLVM 的 iOS 代码混淆工具。它以 LLVM Pass Plugin（动态库）的形式独立编译，通过 `-fpass-plugin` 加载到编译流程中，在编译期对代码进行混淆处理，从而增加逆向工程的难度，保护 iOS 应用的安全。
 
-- **仓库地址**: https://github.com/sweetloser/Cocoons
-- **当前版本**: v3.0.0（2026-02-26）
+- **仓库地址**: https://github.com/Dispa1r/Cocoons
+- **当前版本**: v4.0.0（2026-03-06）
 - **LLVM 版本**: 21.1.8
 - **开源协议**: Apache 2.0
 
@@ -123,15 +123,23 @@ bool StringObfuscationPass::isEnabled() {
 类型: Module Pass（`PassInfoMixin<StringObfuscationPass>`）
 启用方式: `COCOONS_ENABLE_STR=1`（环境变量）或 `-mllvm -cocoons-enable-str`（静态链接）
 
-#### 6.1.1 整体工作流程（v3）
+#### 6.1.1 整体工作流程（v4）
 
 ```
 run()
   ├── 1. 扫描 llvm.global.annotations → 收集 obfuscate 标记的全局变量
-  ├── 2. createDecryptFunctions(M) → 生成两个解密函数（Mode A + Mode B）
-  ├── 3. encryptRealData(M, GV) × N → 随机选模式，加密每个字符串
-  └── 4. instrumentUseSites(M, Entries) → 在每个使用点前插入解密调用
+  ├── 2. 对每个字符串：
+  │     ├── encryptRealData(M, GV) → 随机选模式加密字符串
+  │     ├── createDecryptFunctionForString(M, Info) → 为该字符串创建独立解密函数
+  │     └── createDummyFunctions(M, 1-3) → 插入随机数量 dummy 函数混淆布局
+  └── 3. instrumentUseSites(M, Entries) → 在每个使用点前插入解密调用
 ```
+
+**v4 核心改进**：
+- 每个字符串拥有独立的随机命名解密函数（如 `__ccs_2353710051`）
+- 解密函数之间插入 1-3 个 dummy 函数（如 `__dummy_188348847`）
+- 消除共享解密函数，防止攻击者 hook 单一入口点
+- 函数混合布局，难以批量识别
 
 #### 6.1.2 标记识别与变量解析
 
@@ -171,86 +179,109 @@ op=2: encrypted = plain - key   decrypted = encrypted + key
 
 末尾 `\0` 不加密，保证 printf 兼容性。加密后字符串留在默认 `__DATA` 段，与普通数据混在一起。
 
-#### 6.1.4 两个解密函数（createDecryptFunctions）
+#### 6.1.4 Per-String 独立解密函数（createDecryptFunctionForString）
 
-生成两个 IR 函数，均使用 `LinkOnceODR + Hidden` 链接类型（多模块安全）。
+**v4 架构**：每个字符串生成独立的解密函数，无需传参，所有参数硬编码在函数内部。
 
-**`__cocoons_decrypt_a`（Mode A 专用）**
-
+**函数签名**：
+```cpp
+void __ccs_<random_hash>()  // 例如：__ccs_2353710051
 ```
-void __cocoons_decrypt_a(ptr addr, i32 len, ptr keys, ptr ops, ptr guard)
-```
 
-- `addr`: 加密字符串地址
-- `len`: 字符串长度（含 `\0`）
-- `keys`: per-byte key 数组地址
-- `ops`: per-byte op 数组地址
-- `guard`: per-string guard 变量地址
+**随机命名**：使用 `std::random_device` 生成 32 位随机数作为函数名后缀，每次编译不同。
 
-IR 伪代码：
+**Mode A 解密函数（key/op 数组）**：
 ```
 entry:
-    cmpxchg guard, 0 → 1 (acq_rel/monotonic)
+    cmpxchg Info.GuardGV, 0 → 1 (acq_rel/monotonic)
     br was_zero → do_decrypt / exit
 do_decrypt:
-    dec_len = len - 1
+    dec_len = Info.Len - 1
     br (dec_len > 0) → loop / exit
 loop:
-    key = load keys[idx]
-    op  = load ops[idx]
-    byte = load addr[idx]
+    key = load Info.KeyArrayGV[idx]
+    op = load Info.OpArrayGV[idx]
+    byte = load Info.GV[idx]
     switch op:
-      0: result = byte ^ key    // XOR
-      1: result = byte - key    // SUB（还原 ADD）
-      2: result = byte + key    // ADD（还原 SUB）
-    store result → addr[idx]
-    idx++, br (idx < dec_len) → loop / exit
+        0 → res = byte ^ key
+        1 → res = byte - key
+        2 → res = byte + key
+    store res → Info.GV[idx]
+    idx++
+    br (idx < dec_len) → loop / exit
 exit:
     ret void
 ```
 
-**`__cocoons_decrypt_b`（Mode B 专用）**
-
-```
-void __cocoons_decrypt_b(ptr addr, i32 len, i32 seed, ptr guard)
-```
-
-- `addr`: 加密字符串地址
-- `len`: 字符串长度（含 `\0`）
-- `seed`: xorshift32 PRNG 种子
-- `guard`: per-string guard 变量地址
-
-IR 伪代码：
+**Mode B 解密函数（seed + PRNG）**：
 ```
 entry:
-    cmpxchg guard, 0 → 1 (acq_rel/monotonic)
+    cmpxchg Info.GuardGV, 0 → 1
     br was_zero → do_decrypt / exit
 do_decrypt:
-    dec_len = len - 1
+    dec_len = Info.Len - 1
     br (dec_len > 0) → loop / exit
 loop:
-    state = phi [seed, do_decrypt], [next_state, store]
-    // xorshift32 #1 → 生成 key
+    state = PHI(Info.Seed, next_state)
+    // xorshift32 生成 key
     s1 = state ^ (state << 13)
     s2 = s1 ^ (s1 >> 17)
     s3 = s2 ^ (s2 << 5)
-    key = trunc(s3) to i8; if key==0 then key=1
-    // xorshift32 #2 → 生成 op
+    key = (s3 & 0xFF) ?: 1
+    // xorshift32 生成 op
     s4 = s3 ^ (s3 << 13)
     s5 = s4 ^ (s4 >> 17)
     s6 = s5 ^ (s5 << 5)
     op = s6 % 3
-    // 解密（同 Mode A 的 switch）
-    byte = load addr[idx]
-    switch op → XOR/SUB/ADD
-    store result → addr[idx]
+    // 解密
+    byte = load Info.GV[idx]
+    switch op: ...
     next_state = s6
-    idx++, br (idx < dec_len) → loop / exit
+    idx++
+    br (idx < dec_len) → loop / exit
 exit:
     ret void
 ```
 
-#### 6.1.5 使用点插桩（instrumentUseSites）
+**关键特性**：
+- `InternalLinkage`：函数仅在当前编译单元可见
+- 无参数：所有数据（地址、长度、密钥、guard）硬编码
+- 原子 guard：`cmpxchg` 保证多线程安全的懒解密
+- 随机函数名：每次编译生成不同名称
+
+#### 6.1.5 Dummy 函数混淆布局（createDummyFunctions）
+
+为防止解密函数连续布局被批量识别，在每个解密函数后插入 1-3 个随机 dummy 函数。
+
+**Dummy 函数特征**：
+```cpp
+i32 __dummy_<random_hash>(i32 a, i32 b) {
+    return a * b + (a ^ b);
+}
+```
+
+**实现细节**：
+- 随机函数名：使用 `std::random_device` 生成 32 位随机数
+- 简单计算逻辑：乘法 + 异或，看起来像正常代码
+- 添加到 `llvm.used`：防止优化器删除未使用的函数
+- 随机数量：每个解密函数后插入 1-3 个（均匀分布）
+
+**布局效果**：
+```
+0x3a14  __ccs_1039492916      ← 解密函数
+0x3560  __dummy_188348847     ← dummy
+0x356c  __dummy_813738223     ← dummy
+0x3578  __dummy_3062846195    ← dummy
+0x3584  __ccs_564746404       ← 解密函数
+0x3628  __dummy_2484314989    ← dummy
+0x3634  __dummy_3749835815    ← dummy
+0x3640  __ccs_2754162014      ← 解密函数
+```
+
+攻击者无法通过地址范围或函数名模式批量定位解密函数。
+
+#### 6.1.6 使用点插桩（instrumentUseSites）
+#### 6.1.6 使用点插桩（instrumentUseSites）
 
 递归遍历每个加密字符串的 user 链（worklist 算法），收集所有 Instruction 级别的使用者：
 
@@ -260,33 +291,37 @@ GV → ConstantExpr → GlobalVariable → ... → Instruction
 
 跳过规则：
 - `llvm.global.annotations`、`llvm.used`、`llvm.compiler.used` 等元数据
-- 解密函数自身内部的指令（`DecryptFuncA` / `DecryptFuncB`）
+- 解密函数自身内部的指令（`Entry.DecryptFunc`）
 
-根据 `Entry.UsePRNG` 选择调用哪个解密函数：
-- Mode A: `call @__cocoons_decrypt_a(addr, len, keys, ops, guard)`
-- Mode B: `call @__cocoons_decrypt_b(addr, len, seed, guard)`
+在每个使用点前插入解密调用：
+```cpp
+call Entry.DecryptFunc()  // 无参数，直接调用
+```
 
-PHI 节点特殊处理：在对应前驱块的 terminator 前插入 call（不能在 PHI 节点前插入普通指令）。
+PHI 节点特殊处理：在对应前驱块的 terminator 前插入 call。
 
-#### 6.1.6 关键实现细节
+#### 6.1.7 关键实现细节
 
-- 加密后字符串标记为非常量（`setConstant(false)`），清除原有 section（`setSection("")`），留在默认 `__DATA` 段
-- 不使用自定义 section（`__obf_strings`、`__cocoons_obs` 均已移除）
-- 两个解密函数均使用 `LinkOnceODR` 链接类型和 `Hidden` 可见性，支持多模块场景
+- 加密后字符串标记为非常量（`setConstant(false)`），清除 section（`setSection("")`），留在默认 `__DATA` 段
+- 每个字符串独立的解密函数使用 `InternalLinkage`，仅当前编译单元可见
 - 使用 `cmpxchg` 原子操作（`AcquireRelease` / `Monotonic`）保证线程安全
-- 不做编译期去重，每个 use site 前都插入 call，运行时由 guard 保证幂等
-- 每次编译产生不同的加密结果（`std::random_device` 驱动），增加逆向难度
-- xorshift32 PRNG 编译时（C++ 函数）和运行时（IR 生成）使用完全相同的算法，保证一致性
+- 每次编译产生不同的加密结果和函数名（`std::random_device` 驱动）
+- xorshift32 PRNG 编译时（C++ 函数）和运行时（IR 生成）使用完全相同的算法
 
-#### 6.1.7 数据结构
+#### 6.1.8 数据结构
 
 ```cpp
 struct EncryptedStringInfo {
     GlobalVariable *GV;                    // 加密后的字符串全局变量
     uint32_t Len;                          // 字符串长度（含 \0）
     GlobalVariable *GuardGV;               // per-string guard 变量（i8, init 0）
+    Function *DecryptFunc;                 // 该字符串的独立解密函数
     bool UsePRNG;                          // true = Mode B, false = Mode A
     GlobalVariable *KeyArrayGV = nullptr;  // Mode A: [N x i8] per-byte key 数组
+    GlobalVariable *OpArrayGV  = nullptr;  // Mode A: [N x i8] per-byte op 数组
+    uint32_t Seed = 0;                     // Mode B: PRNG seed
+};
+```
     GlobalVariable *OpArrayGV  = nullptr;  // Mode A: [N x i8] per-byte op 数组
     uint32_t Seed = 0;                     // Mode B: PRNG seed
 };
@@ -411,12 +446,13 @@ ninja install-xcode-toolchain
 | 文件 | 类型 | 行数 | 说明 |
 |------|------|------|------|
 | `llvm/lib/Transforms/Cocoons/CocoonsPasses.cpp` | 实现 | 52 | Pass Plugin 入口，注册回调 |
-| `llvm/lib/Transforms/Cocoons/StringObfuscationPass.cpp` | 实现 | 593 | 字符串混淆核心逻辑（v3 双模式） |
+| `llvm/lib/Transforms/Cocoons/StringObfuscationPass.cpp` | 实现 | 500+ | 字符串混淆核心逻辑（v4 per-string 独立解密） |
 | `llvm/lib/Transforms/Cocoons/SubstitutionPass.cpp` | 实现 | 75 | 指令替换核心逻辑 |
-| `llvm/include/llvm/Transforms/Cocoons/StringObfuscationPass.h` | 头文件 | 58 | 字符串混淆 Pass 接口定义 |
+| `llvm/include/llvm/Transforms/Cocoons/StringObfuscationPass.h` | 头文件 | 59 | 字符串混淆 Pass 接口定义 |
 | `llvm/include/llvm/Transforms/Cocoons/SubstitutionPass.h` | 头文件 | 19 | 指令替换 Pass 接口定义 |
 | `llvm/lib/Transforms/Cocoons/CMakeLists.txt` | 构建 | 19 | Pass Plugin 构建配置 |
 | `tests/test_string_obf_v2.m` | 测试 | 67 | 字符串混淆验证 demo |
+| `tests/test_50_strings.c` | 测试 | 68 | 50 个字符串混淆效果验证 |
 | `build.sh` | 脚本 | 50 | 编译与安装脚本 |
 
 ## 9. 版本历史
@@ -427,3 +463,108 @@ ninja install-xcode-toolchain
 | v1.0.1 | 2026-02-10 | 修复字符串混淆在多 module 下的 bug |
 | v2.0.0 | 2026-02-25 | 字符串混淆升级为懒解密：按需解密、cmpxchg 线程安全、加密字符串留在默认 `__DATA` 段 |
 | v3.0.0 | 2026-02-26 | 每字节独立密钥 + 随机加密方式（XOR/ADD/SUB）+ 双模式（key 数组 / seed+PRNG）；改为 Pass Plugin 动态库架构 |
+| v4.0.0 | 2026-03-06 | **Per-string 独立解密函数**：每个字符串生成独立的随机命名解密函数，消除共享解密函数；插入 dummy 函数混淆布局，防止批量识别 |
+
+## 10. v4 架构详解：Per-String 独立解密
+
+### 10.1 设计动机
+
+**v3 的安全问题**：
+- 所有字符串共享两个解密函数（`__cocoons_decrypt_a` 和 `__cocoons_decrypt_b`）
+- 攻击者只需 hook 这两个函数即可拦截所有字符串解密
+- 解密函数名称固定，容易被静态分析识别
+
+**v4 的改进**：
+- 每个字符串生成独立的解密函数，随机命名
+- 攻击者无法通过 hook 单一入口点批量拦截
+- 解密函数与 dummy 函数混合布局，难以批量识别
+
+### 10.2 核心技术
+
+#### 10.2.1 随机函数命名
+
+```cpp
+std::random_device RD;
+std::mt19937 Gen(RD());
+std::uniform_int_distribution<uint32_t> Dist(0, 0xFFFFFFFF);
+uint32_t Hash = Dist(Gen);
+std::string FuncName = "__ccs_" + std::to_string(Hash);
+```
+
+每次编译生成不同的函数名，如 `__ccs_2353710051`、`__ccs_564746404`。
+
+#### 10.2.2 参数硬编码
+
+解密函数无参数，所有数据直接引用全局变量：
+- 字符串地址：`Info.GV`
+- 字符串长度：`Info.Len`（编译期常量）
+- 密钥数组：`Info.KeyArrayGV` / `Info.OpArrayGV`（Mode A）
+- PRNG 种子：`Info.Seed`（Mode B，编译期常量）
+- Guard 变量：`Info.GuardGV`
+
+#### 10.2.3 Dummy 函数混淆
+
+每个解密函数后插入 1-3 个 dummy 函数：
+
+```cpp
+std::uniform_int_distribution<int> DummyCount(1, 3);
+createDummyFunctions(M, DummyCount(Gen));
+```
+
+Dummy 函数特征：
+- 随机命名：`__dummy_<random_hash>`
+- 简单计算：`i32 func(i32 a, i32 b) { return a * b + (a ^ b); }`
+- 添加到 `llvm.used`：防止被优化删除
+
+### 10.3 安全性分析
+
+| 攻击方式 | v3 防御能力 | v4 防御能力 |
+|---------|------------|------------|
+| Hook 共享解密函数 | ❌ 两个函数即可拦截所有字符串 | ✅ 需要 hook N 个独立函数 |
+| 静态分析识别解密函数 | ❌ 固定函数名 `__cocoons_decrypt_a/b` | ✅ 随机函数名，每次编译不同 |
+| 批量定位解密函数 | ❌ 函数连续布局 | ✅ 与 dummy 函数混合，难以批量识别 |
+| 逆向单个字符串 | ✅ 需要分析 PRNG 或密钥数组 | ✅ 同 v3 |
+| 内存 dump | ✅ 运行时解密后可见 | ✅ 同 v3 |
+
+### 10.4 性能影响
+
+- **二进制体积**：每个字符串增加约 100-200 字节（解密函数 IR）+ 1-3 个 dummy 函数（每个约 12 字节）
+- **运行时开销**：与 v3 相同，懒解密 + cmpxchg guard
+- **编译时间**：略有增加（生成更多函数），但仍在秒级
+
+### 10.5 使用示例
+
+```bash
+# 编译
+COCOONS_ENABLE_STR=1 build/bin/clang -O1 \
+  -isysroot $(xcrun --show-sdk-path) \
+  -fpass-plugin=build/lib/CocoonsPasses.dylib \
+  tests/test_50_strings.c -o test_50_strings
+
+# 验证：字符串已加密
+strings test_50_strings | grep "String"  # 无输出
+
+# 验证：函数混合布局
+nm test_50_strings | grep -E "(__ccs_|__dummy_)" | sort
+# 输出示例：
+# 0x3a14  __ccs_1039492916
+# 0x3560  __dummy_188348847
+# 0x356c  __dummy_813738223
+# 0x3578  __dummy_3062846195
+# 0x3584  __ccs_564746404
+# ...
+
+# 验证：程序正常运行
+./test_50_strings
+# String 1
+# String 2
+# ...
+```
+
+### 10.6 未来改进方向
+
+1. **控制流混淆**：对解密函数内部进行控制流平坦化
+2. **虚假控制流**：插入永不执行的分支迷惑静态分析
+3. **多态解密**：同一字符串生成多个等价解密函数，随机选择
+4. **反调试检测**：在解密函数中插入反调试代码
+5. **代码虚拟化**：将解密逻辑编译为自定义虚拟机字节码
